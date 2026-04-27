@@ -1,0 +1,76 @@
+# MCP System — Default Configuration
+# Values here are overridden by environment-specific files and then
+# by environment variables (env vars take highest precedence).
+
+app:
+  name: mcp-system
+  version: "0.1.0"
+  environment: development
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+  reload: true
+
+context:
+  max_tokens: 128000
+  max_messages: 1000
+  ttl_seconds: 86400         # 24 hours
+  overflow_strategy: evict   # evict | summarize | reject
+
+memory:
+  short_term:
+    ttl_seconds: 3600        # 1 hour
+    max_connections: 20
+  long_term:
+    collection: mcp_memory
+    vector_size: 1536
+    hnsw:
+      m: 16
+      ef_construct: 100
+      full_scan_threshold: 10000
+    score_threshold: 0.6
+    top_k: 5
+
+modules:
+  timeout_seconds: 30
+  hot_reload: false
+  builtin:
+    - echo
+    - text-summarizer
+    - memory-retriever
+
+auth:
+  jwt:
+    algorithm: HS256
+    expire_minutes: 60
+    refresh_expire_days: 7
+  api_key_header: X-API-Key
+
+rate_limit:
+  enabled: true
+  requests_per_window: 100
+  window_seconds: 60
+
+observability:
+  log_level: INFO
+  log_format: json            # json | text
+  metrics:
+    enabled: true
+    port: 9091
+  tracing:
+    enabled: false
+    endpoint: "http://localhost:4317"
+    service_name: mcp-system
+
+cors:
+  origins:
+    - "http://localhost:3000"
+    - "http://localhost:8080"
+  allow_credentials: true
+
+embeddings:
+  provider: openai            # openai | sentence-transformers | cohere
+  model: text-embedding-3-small
+  batch_size: 64

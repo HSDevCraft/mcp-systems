@@ -1,0 +1,52 @@
+# MCP System — pip-installable requirements
+# Generated from pyproject.toml for environments that prefer requirements.txt.
+# For a full install with dev deps: pip install -e ".[dev]"
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# ── Data validation ───────────────────────────────────────────────────────────
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+
+# ── HTTP clients ──────────────────────────────────────────────────────────────
+httpx>=0.28.0
+aiohttp>=3.11.0
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
+redis[hiredis]>=5.2.0
+
+# ── Vector DB ─────────────────────────────────────────────────────────────────
+qdrant-client>=1.12.0
+
+# ── Embeddings ────────────────────────────────────────────────────────────────
+openai>=1.57.0
+sentence-transformers>=3.3.0
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# ── Observability ─────────────────────────────────────────────────────────────
+structlog>=24.4.0
+prometheus-client>=0.21.0
+opentelemetry-api>=1.29.0
+opentelemetry-sdk>=1.29.0
+opentelemetry-instrumentation-fastapi>=0.50b0
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+slowapi>=0.1.9
+
+# ── Config ────────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.1
+pyyaml>=6.0.2
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tenacity>=9.0.0
+orjson>=3.10.0
+cryptography>=43.0.0
+cachetools>=5.5.0
+tiktoken>=0.8.0
+packaging>=24.0

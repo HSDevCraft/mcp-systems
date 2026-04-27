@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - security
+    open-pull-requests-limit: 10
+    groups:
+      fastapi:
+        patterns: ["fastapi", "uvicorn", "starlette", "pydantic*"]
+      observability:
+        patterns: ["structlog", "prometheus-client", "opentelemetry*"]
+      security:
+        patterns: ["python-jose", "passlib", "cryptography"]
+      storage:
+        patterns: ["redis", "qdrant-client"]
+
+  - package-ecosystem: docker
+    directory: "/deploy"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies

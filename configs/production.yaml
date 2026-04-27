@@ -1,0 +1,44 @@
+# MCP System — Production Configuration Overrides
+# Merged on top of default.yaml at runtime.
+# All secrets must come from environment variables — never hardcode here.
+
+server:
+  workers: 4
+  reload: false
+
+context:
+  overflow_strategy: evict
+
+memory:
+  short_term:
+    ttl_seconds: 7200        # 2 hours in production
+    max_connections: 50
+  long_term:
+    hnsw:
+      m: 32                  # Higher connectivity for better recall
+      ef_construct: 200
+    score_threshold: 0.65    # Slightly stricter in production
+
+modules:
+  timeout_seconds: 60        # Longer timeout for heavy modules
+  hot_reload: false          # Never hot-reload in production
+
+auth:
+  jwt:
+    expire_minutes: 30       # Shorter token lifetime in production
+
+rate_limit:
+  enabled: true
+  requests_per_window: 500   # Higher limit for production clients
+  window_seconds: 60
+
+observability:
+  log_level: WARNING
+  log_format: json
+  metrics:
+    enabled: true
+  tracing:
+    enabled: true
+
+cors:
+  origins: []                # Set via CORS_ORIGINS env var in production

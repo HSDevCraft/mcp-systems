@@ -1,0 +1,36 @@
+# MCP System — Test Configuration Overrides
+# Applied when MCP_ENV=test. Disables external deps for fast CI runs.
+
+server:
+  workers: 1
+  reload: false
+
+context:
+  max_tokens: 10000
+  ttl_seconds: 300          # 5 minutes
+  overflow_strategy: evict
+
+memory:
+  short_term:
+    ttl_seconds: 60
+    max_connections: 5
+  long_term:
+    score_threshold: 0.0    # Accept all results in tests
+
+modules:
+  timeout_seconds: 10
+  hot_reload: false
+
+auth:
+  jwt:
+    expire_minutes: 5
+
+rate_limit:
+  enabled: false            # Disabled in tests
+
+observability:
+  log_level: WARNING        # Quiet in tests
+  metrics:
+    enabled: false
+  tracing:
+    enabled: false

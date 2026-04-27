@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-config
+  namespace: mcp-system
+data:
+  MCP_ENV: "production"
+  MCP_HOST: "0.0.0.0"
+  MCP_PORT: "8000"
+  MCP_WORKERS: "4"
+  MCP_DEBUG: "false"
+  LOG_LEVEL: "WARNING"
+  LOG_FORMAT: "json"
+  ENABLE_METRICS: "true"
+  METRICS_PORT: "9091"
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_REQUESTS: "500"
+  RATE_LIMIT_WINDOW: "60"
+  CONTEXT_MAX_TOKENS: "128000"
+  CONTEXT_TTL_SECONDS: "86400"
+  EMBEDDING_PROVIDER: "openai"
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  QDRANT_COLLECTION: "mcp_memory"
+  QDRANT_VECTOR_SIZE: "1536"
+  OTEL_ENABLED: "true"
+  OTEL_SERVICE_NAME: "mcp-system"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-secrets
+  namespace: mcp-system
+type: Opaque
+stringData:
+  MCP_SECRET_KEY: "CHANGE_ME_USE_REAL_SECRET"
+  JWT_SECRET_KEY: "CHANGE_ME_USE_REAL_JWT_SECRET"
+  OPENAI_API_KEY: "sk-..."
+  REDIS_URL: "redis://redis-master:6379/0"
+  QDRANT_URL: "http://qdrant:6333"
+  QDRANT_API_KEY: ""

@@ -230,16 +230,191 @@ Servers are treated as **untrusted** by default. The host/client must:
 ```
 mcp/
 ├── server/
-│   ├── __init__.py      ← Server class, @server.list_tools() decorators
-│   ├── stdio.py         ← stdio_server() context manager
-│   ├── sse.py           ← SseServerTransport
-│   └── models.py        ← InitializationOptions
+│   ├── __init__.py        ← Server class, @server.list_tools() decorators
+│   ├── fastmcp/           ← High-level FastMCP builder (recommended)
+│   │   ├── __init__.py    ← FastMCP class, Context
+│   │   ├── tools.py       ← @mcp.tool() decorator + auto-schema generation
+│   │   ├── resources.py   ← @mcp.resource() decorator + URI template matching
+│   │   └── prompts.py     ← @mcp.prompt() decorator
+│   ├── stdio.py           ← stdio_server() context manager
+│   ├── sse.py             ← SseServerTransport
+│   └── models.py          ← InitializationOptions
 ├── client/
-│   ├── __init__.py      ← ClientSession
-│   ├── stdio.py         ← stdio_client() context manager
-│   └── sse.py           ← SseClientTransport
-├── types.py             ← All protocol types (Tool, Resource, Prompt, …)
+│   ├── __init__.py        ← ClientSession
+│   ├── stdio.py           ← stdio_client() context manager
+│   └── sse.py             ← SseClientTransport
+├── types.py               ← All protocol types (Tool, Resource, Prompt, …)
 └── shared/
-    ├── memory.py        ← In-memory transport for testing
-    └── session.py       ← BaseSession (shared client/server base)
+    ├── memory.py          ← In-memory transport for testing
+    └── session.py         ← BaseSession (shared client/server base)
 ```
+
+---
+
+## Deployment Topologies
+
+### Topology 1 — Local Tools (Most Common)
+
+```
+┌──────────────────────────────────────────┐
+│  User's Machine                          │
+│                                          │
+│  ┌────────────────────┐                  │
+│  │  Claude Desktop    │                  │
+│  │  (Host + Clients)  │                  │
+│  └──────┬─────────────┘                  │
+│         │ stdio (subprocess)              │
+│  ┌──────▼──────┐  ┌──────────────┐       │
+│  │ FS Server   │  │  Git Server  │       │
+│  │ (Python)    │  │  (Node.js)   │       │
+│  └─────────────┘  └──────────────┘       │
+└──────────────────────────────────────────┘
+```
+
+Best for: IDE plugins, local file access, personal tools.
+
+### Topology 2 — Remote Services (Team/Cloud)
+
+```
+┌─────────────────────────┐         ┌──────────────────────────┐
+│  Developer Machine      │         │  Cloud / Internal         │
+│                         │         │                           │
+│  ┌───────────────────┐  │  HTTPS  │  ┌────────────────────┐  │
+│  │  Claude / IDE     │  │ ──────► │  │  GitHub MCP Server │  │
+│  │  (Host + Client)  │  │         │  │  (FastAPI + SSE)   │  │
+│  └───────────────────┘  │         │  └────────────────────┘  │
+│                         │         │  ┌────────────────────┐  │
+│                         │  HTTPS  │  │  DB MCP Server     │  │
+│                         │ ──────► │  │  (FastAPI + SSE)   │  │
+└─────────────────────────┘         └──────────────────────────┘
+```
+
+Best for: shared company tools, SaaS integrations, team codebases.
+
+### Topology 3 — Hybrid (Local + Remote)
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  Host                                                         │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Client Manager                                         │  │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────────┐    │  │
+│  │  │Client 1│  │Client 2│  │Client 3│  │  Client 4  │    │  │
+│  │  └───┬────┘  └───┬────┘  └───┬────┘  └─────┬──────┘    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└──────┬──────────────┬───────────┬──────────────┬───────────────┘
+       │ stdio        │ stdio     │ HTTPS         │ HTTPS
+  ┌────▼────┐   ┌─────▼────┐  ┌──▼──────────┐ ┌──▼──────────┐
+  │FS Server│   │Git Server│  │ GitHub API  │ │ Slack API   │
+  │(local)  │   │(local)   │  │ (remote)    │ │ (remote)    │
+  └─────────┘   └──────────┘  └─────────────┘ └─────────────┘
+```
+
+Best for: power users with both local and cloud tools.
+
+### Topology 4 — Embedded / In-Process
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Single Python Process                                  │
+│                                                        │
+│  ┌──────────────────────────┐                          │
+│  │  Host + LLM Logic        │                          │
+│  └──────────────────────────┘                          │
+│         ↕ in-memory transport (no subprocess)          │
+│  ┌──────────────────────────┐                          │
+│  │  MCP Server (in-process) │                          │
+│  │  (testing or embedding)  │                          │
+│  └──────────────────────────┘                          │
+└────────────────────────────────────────────────────────┘
+```
+
+Best for: unit tests, notebooks, tightly coupled services.
+
+---
+
+## Server-Initiated Flow (Sampling)
+
+The most complex message flow — server initiates an LLM call back through the client:
+
+```
+HOST                  CLIENT                SERVER                LLM API
+  │                     │                     │                     │
+  │ call_tool("agent")  │                     │                     │
+  ├────────────────────►│                     │                     │
+  │                     │ tools/call id=1     │                     │
+  │                     ├────────────────────►│                     │
+  │                     │                     │ (thinks, needs LLM) │
+  │                     │ sampling/createMsg  │                     │
+  │                     │◄────────────────────┤                     │
+  │  [Human approval UI]│                     │                     │
+  │◄────────────────────┤                     │                     │
+  │ [User approves]     │                     │                     │
+  ├────────────────────►│                     │                     │
+  │                     │─────────────────────────────────────────►│
+  │                     │◄────────── LLM response ─────────────────┤
+  │                     │ sampling result     │                     │
+  │                     ├────────────────────►│                     │
+  │                     │                     │ (processes result)  │
+  │                     │ tools/call result   │                     │
+  │                     │◄────────────────────┤                     │
+  │ ToolResult          │                     │                     │
+  │◄────────────────────┤                     │                     │
+```
+
+Key insight: a single `tools/call` can trigger multiple `sampling/createMessage` round-trips internally.
+
+---
+
+## Client Manager — Tool Namespace Design
+
+When a host connects to multiple servers, tool names must be unique. The standard approach:
+
+```python
+# Namespace strategy options:
+# 1. Server-prefix (most common)
+"github__create_pr"      # server_name + __ + tool_name
+"filesystem__read_file"
+
+# 2. Domain-prefix
+"vcs.create_pr"
+"fs.read_file"
+
+# 3. Tool registry with alias resolution
+# Store: {"create_pr": "github", "read_file": "filesystem"}
+# If collision: raise error or use server prefix
+
+# In practice (pseudo-code):
+class ToolNamespace:
+    def mangle(self, server: str, tool: str) -> str:
+        return f"{server}__{tool}"
+
+    def demangle(self, namespaced: str) -> tuple[str, str]:
+        server, _, tool = namespaced.partition("__")
+        return server, tool
+```
+
+---
+
+## Common Architectural Pitfalls
+
+| Pitfall | Symptom | Fix |
+|---------|---------|-----|
+| **Stdout pollution** | Protocol corruption in stdio mode | Never `print()` to stdout in servers; use `stderr` |
+| **Blocking tool handlers** | Client timeouts on long operations | Use `async def` for all tool handlers; never `time.sleep()` |
+| **Missing capability check** | `McpError -32601` on first call | Always check `caps.tools` before calling `tools/list` |
+| **Shared mutable state** | Race conditions in concurrent tool calls | Use `asyncio.Lock` or `contextvars` for per-request state |
+| **Hardcoded server names** | Name collisions in multi-server host | Use namespacing (`server__toolname`) |
+| **No roots enforcement** | Path traversal vulnerability | Always call `roots/list` and validate against results |
+| **Session state in global vars** | Multi-session servers share state | Use `server.request_context` for per-session data |
+| **Not handling `initialized` notification** | Server acts before handshake completes | Wait for `notifications/initialized` before doing work |
+
+---
+
+## Key Takeaways
+
+- **One client = one server connection.** A host manages N clients for N servers simultaneously.
+- **Servers are untrusted by default.** All trust decisions live in the host.
+- **Choose topology by latency and isolation needs**: stdio for local, SSE/HTTP for remote, in-process for testing.
+- **The sampling flow is bidirectional** — servers can ask the host to call the LLM on their behalf.
+- **Namespace your tools** when managing multiple servers to prevent name collisions.

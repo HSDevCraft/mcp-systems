@@ -329,3 +329,301 @@ If it *changes* state or *does* something → Tool.
 | Validate URI parameters | Prevent path traversal and injection attacks |
 | Limit resource content size | Large responses waste context window tokens |
 | Use subscriptions for frequently-changing data | Avoids polling loops by LLM |
+
+---
+
+## URI Templates (RFC 6570)
+
+MCP uses **RFC 6570 Level 1 URI templates** for dynamic resources. FastMCP handles template matching automatically.
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("template-demo")
+
+# Simple variable expansion: {variable}
+@mcp.resource("file://{path}")
+def read_file(path: str) -> str:
+    """Read any file. path = full filesystem path after file://"""
+    ...
+
+# Multiple variables
+@mcp.resource("db://{schema}/{table}/{row_id}")
+def get_row(schema: str, table: str, row_id: str) -> str:
+    """Fetch a specific row. Example: db://public/users/42"""
+    ...
+
+# Query-style template (non-standard but practical)
+@mcp.resource("search://{index}?q={query}")
+def search_index(index: str, query: str) -> str:
+    """Search within a named index."""
+    ...
+```
+
+### Template resolution logic
+
+```python
+# How FastMCP matches URIs to templates:
+# Template: "db://users/{user_id}"
+# Incoming:  "db://users/42"
+# Result:    user_id = "42"
+
+# Template: "repo://{owner}/{repo}/{path}"
+# Incoming:  "repo://anthropic/mcp/README.md"
+# Result:    owner="anthropic", repo="mcp", path="README.md"
+
+# No match → resources/read returns an error
+```
+
+---
+
+## Large Resource Handling
+
+Resources that exceed context window limits should be chunked:
+
+### Chunked text resource
+
+```python
+from mcp.server.fastmcp import FastMCP
+import math
+
+mcp = FastMCP("chunked-server")
+
+CHUNK_SIZE = 4000  # characters per chunk (adjust for token budget)
+
+@mcp.resource("file://{path}/chunk/{chunk_index}")
+def read_file_chunk(path: str, chunk_index: str) -> str:
+    """
+    Read a chunk of a large file.
+    chunk_index: 0-based integer chunk number.
+    First call read file://{path}/meta to get total chunk count.
+    """
+    idx = int(chunk_index)
+    with open(path) as f:
+        content = f.read()
+    start = idx * CHUNK_SIZE
+    chunk = content[start:start + CHUNK_SIZE]
+    if not chunk:
+        raise ValueError(f"Chunk {idx} out of range")
+    return chunk
+
+@mcp.resource("file://{path}/meta")
+def get_file_meta(path: str) -> str:
+    """Get metadata for a file: size, chunk count, mime type."""
+    import json, os
+    size = os.path.getsize(path)
+    total_chunks = math.ceil(size / CHUNK_SIZE)
+    return json.dumps({
+        "path":         path,
+        "size_bytes":   size,
+        "chunk_size":   CHUNK_SIZE,
+        "total_chunks": total_chunks,
+    })
+```
+
+### Streaming-style pagination for large lists
+
+```python
+@mcp.resource("db://orders/page/{page_num}")
+async def get_orders_page(page_num: str) -> str:
+    """Get paginated orders. page_num: 1-based page number."""
+    import json
+    page  = int(page_num)
+    limit = 20
+    offset = (page - 1) * limit
+
+    async with get_db() as conn:
+        rows = await conn.fetch(
+            "SELECT id, status, total FROM orders ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            limit, offset,
+        )
+        total = await conn.fetchval("SELECT COUNT(*) FROM orders")
+
+    return json.dumps({
+        "page":        page,
+        "total_pages": math.ceil(total / limit),
+        "orders":      [dict(r) for r in rows],
+    }, default=str)
+```
+
+---
+
+## Resource Caching
+
+Cache expensive resources to avoid redundant computation:
+
+```python
+import time, json
+from functools import wraps
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("cached-server")
+
+# Simple in-memory TTL cache
+_cache: dict[str, tuple[str, float]] = {}
+
+def cached_resource(ttl_seconds: float = 60.0):
+    """Decorator: cache resource reads for ttl_seconds."""
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = f"{fn.__name__}:{args}:{kwargs}"
+            if key in _cache:
+                value, ts = _cache[key]
+                if time.monotonic() - ts < ttl_seconds:
+                    return value
+            result = fn(*args, **kwargs)
+            _cache[key] = (result, time.monotonic())
+            return result
+        return wrapper
+    return decorator
+
+@mcp.resource("report://summary")
+@cached_resource(ttl_seconds=300)  # refresh every 5 minutes
+async def get_summary() -> str:
+    """Expensive aggregated business summary (cached 5min)."""
+    async with get_db() as conn:
+        stats = await conn.fetchrow("SELECT ... FROM orders ...")
+    return json.dumps(dict(stats), default=str)
+```
+
+---
+
+## Embedding Resources in LLM Context
+
+The host can embed resource content directly into the LLM context window:
+
+```python
+# Host-side (pseudo-code): inject resource into LLM context
+async def build_context(session: ClientSession, query: str) -> list[dict]:
+    messages = []
+
+    # 1. Read relevant resources
+    readme = await session.read_resource("file:///workspace/README.md")
+    config = await session.read_resource("config://app")
+
+    # 2. Inject as system context
+    context_text = "\n\n---\n\n".join([
+        f"**README.md**:\n{readme.contents[0].text}",
+        f"**App Config**:\n{config.contents[0].text}",
+    ])
+    messages.append({"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"})
+
+    return messages
+```
+
+### Resource-in-prompt pattern (server-side)
+
+```python
+from pathlib import Path
+import mcp.types as types
+from mcp.server import Server
+
+server = Server("context-server")
+
+@server.get_prompt()
+async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult:
+    if name == "analyse_with_context":
+        workspace = Path("/workspace")
+        readme    = (workspace / "README.md").read_text()
+        code_file = Path(arguments["file_path"]).read_text()
+
+        return types.GetPromptResult(
+            description="Analyse a file with project context",
+            messages=[
+                types.PromptMessage(
+                    role="user",
+                    content=types.EmbeddedResource(
+                        type="resource",
+                        resource=types.TextResourceContents(
+                            uri="file:///workspace/README.md",
+                            mimeType="text/markdown",
+                            text=readme,
+                        ),
+                    ),
+                ),
+                types.PromptMessage(
+                    role="user",
+                    content=types.TextContent(
+                        type="text",
+                        text=f"Given the project context above, analyse this file:\n\n```\n{code_file}\n```",
+                    ),
+                ),
+            ],
+        )
+```
+
+---
+
+## Virtual / Computed Resources
+
+Resources that aggregate or transform data on-demand:
+
+```python
+@mcp.resource("dashboard://metrics")
+async def get_metrics_dashboard() -> str:
+    """
+    Live metrics dashboard aggregated from multiple sources.
+    Recomputed on every read. Use for real-time monitoring.
+    Returns JSON with active_users, orders_today, revenue_today, error_rate.
+    """
+    import json, asyncio
+
+    # Fetch all metrics concurrently
+    active_users, orders_today, revenue, error_rate = await asyncio.gather(
+        count_active_users(),
+        count_orders_today(),
+        calculate_revenue_today(),
+        calculate_error_rate_1h(),
+    )
+
+    return json.dumps({
+        "timestamp":    "2024-11-05T10:30:00Z",
+        "active_users": active_users,
+        "orders_today": orders_today,
+        "revenue_today": revenue,
+        "error_rate_1h": error_rate,
+        "status":       "healthy" if error_rate < 0.01 else "degraded",
+    }, indent=2)
+
+
+@mcp.resource("git://diff/{base}..{head}")
+async def get_git_diff(base: str, head: str) -> str:
+    """
+    Compute a git diff between two refs.
+    Example: git://diff/main..feature-branch
+    """
+    import asyncio
+    proc = await asyncio.create_subprocess_exec(
+        "git", "diff", f"{base}..{head}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    return stdout.decode()
+```
+
+---
+
+## Common Resource Pitfalls
+
+| Pitfall | Problem | Fix |
+|---------|---------|-----|
+| Returning huge text in one resource | Context window exhaustion | Chunk large files; use metadata + chunk URIs |
+| Mutable URI-embedded state | Cache invalidation issues | Use subscription notifications instead |
+| No path validation | Path traversal attack | Validate all URI params against allowed roots |
+| Forgetting MIME type | Host renders incorrectly | Always set `mimeType` |
+| Inconsistent URI casing | Resource not found | Normalize URIs consistently |
+| Static list ignoring roots | Returns inaccessible resources | Filter list by current roots |
+| No subscription for live data | LLM polls repeatedly | Declare `resources.subscribe: true` and push notifications |
+
+---
+
+## Key Takeaways
+
+- **Resources are read-only data primitives** — use Tools for writes and actions.
+- **URIs are the identity** of a resource — make them stable and predictable.
+- **URI templates** enable dynamic resources parameterized by path variables.
+- **Subscriptions** eliminate polling — let the server push change notifications.
+- **Chunk large content** — return metadata + chunk URIs instead of one giant response.
+- **Virtual/computed resources** are fine — resources can be aggregations computed on demand.

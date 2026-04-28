@@ -420,3 +420,403 @@ async def test_calculator_add_properties(client, a, b):
     assert not result.isError
     assert str(a + b) in result.content[0].text
 ```
+
+---
+
+## Contract Testing
+
+Verify that your server conforms to the MCP protocol contract:
+
+```python
+# tests/contract/test_mcp_contract.py
+"""
+Contract tests verify that a server correctly implements the MCP protocol spec.
+These tests can be run against ANY MCP server — they are server-agnostic.
+"""
+import pytest
+import pytest_asyncio
+from mcp.shared.memory import create_connected_server_and_client_session
+from my_server import build_server
+
+@pytest_asyncio.fixture
+async def client():
+    async with create_connected_server_and_client_session(build_server()) as session:
+        yield session
+
+# ── Capability contract ───────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_initialize_returns_required_fields(client):
+    """Server must return serverInfo and protocolVersion."""
+    result = client._initialized_result
+    assert result.serverInfo is not None
+    assert result.serverInfo.name, "serverInfo.name must not be empty"
+    assert result.serverInfo.version, "serverInfo.version must not be empty"
+    assert result.protocolVersion == "2024-11-05", "Must negotiate current protocol version"
+
+@pytest.mark.asyncio
+async def test_tools_list_schema_valid(client):
+    """Every tool must have name, description, and valid JSON Schema inputSchema."""
+    if not client._initialized_result.capabilities.tools:
+        pytest.skip("Server does not expose tools")
+
+    result = await client.list_tools()
+    for tool in result.tools:
+        assert tool.name, f"Tool missing name: {tool}"
+        assert tool.description, f"Tool missing description: {tool.name}"
+        assert isinstance(tool.inputSchema, dict), f"inputSchema must be dict: {tool.name}"
+        assert tool.inputSchema.get("type") == "object", \
+            f"inputSchema must be type=object: {tool.name}"
+
+@pytest.mark.asyncio
+async def test_tool_unknown_name_raises_protocol_error(client):
+    """Calling unknown tool must raise McpError, not return isError=True."""
+    from mcp.shared.exceptions import McpError
+    if not client._initialized_result.capabilities.tools:
+        pytest.skip("Server does not expose tools")
+
+    with pytest.raises(McpError) as exc_info:
+        await client.call_tool("__nonexistent_tool_xyz__", {})
+    assert exc_info.value.error.code in (-32602, -32601), \
+        "Unknown tool must return INVALID_PARAMS or METHOD_NOT_FOUND"
+
+@pytest.mark.asyncio
+async def test_resources_list_has_uri_and_name(client):
+    """Every resource must have uri and name."""
+    if not client._initialized_result.capabilities.resources:
+        pytest.skip("Server does not expose resources")
+
+    result = await client.list_resources()
+    for resource in result.resources:
+        assert resource.uri,  f"Resource missing uri: {resource}"
+        assert resource.name, f"Resource missing name: {resource.uri}"
+
+@pytest.mark.asyncio
+async def test_prompts_list_has_name_and_description(client):
+    """Every prompt must have name and description."""
+    if not client._initialized_result.capabilities.prompts:
+        pytest.skip("Server does not expose prompts")
+
+    result = await client.list_prompts()
+    for prompt in result.prompts:
+        assert prompt.name, f"Prompt missing name: {prompt}"
+        assert prompt.description, f"Prompt missing description: {prompt.name}"
+
+@pytest.mark.asyncio
+async def test_ping_responds(client):
+    """Server must respond to ping within 5 seconds."""
+    import asyncio
+    await asyncio.wait_for(client.send_ping(), timeout=5.0)
+
+@pytest.mark.asyncio
+async def test_pagination_cursor_works(client):
+    """Pagination must work: list with cursor should return next page."""
+    if not client._initialized_result.capabilities.tools:
+        pytest.skip("Server does not expose tools")
+
+    first_page = await client.list_tools()
+    if first_page.nextCursor:
+        second_page = await client.list_tools(cursor=first_page.nextCursor)
+        first_names  = {t.name for t in first_page.tools}
+        second_names = {t.name for t in second_page.tools}
+        # Second page should not repeat items from first page
+        overlap = first_names & second_names
+        assert not overlap, f"Pagination returned duplicate tools: {overlap}"
+```
+
+---
+
+## Performance Testing
+
+Measure latency and throughput of your MCP server:
+
+```python
+# tests/performance/test_throughput.py
+import asyncio, time, statistics
+import pytest
+import pytest_asyncio
+from mcp.shared.memory import create_connected_server_and_client_session
+from my_server import build_server
+
+@pytest_asyncio.fixture(scope="module")
+async def shared_client():
+    """Reuse one session for all perf tests (avoid init overhead per test)."""
+    async with create_connected_server_and_client_session(build_server()) as session:
+        yield session
+
+@pytest.mark.asyncio
+@pytest.mark.performance
+async def test_tool_latency_p99(shared_client):
+    """p99 latency for a simple tool call should be < 50ms."""
+    N = 100
+    latencies = []
+
+    for _ in range(N):
+        start = time.perf_counter()
+        result = await shared_client.call_tool("calculator", {"expression": "2+2"})
+        elapsed = (time.perf_counter() - start) * 1000  # ms
+        latencies.append(elapsed)
+        assert not result.isError
+
+    latencies.sort()
+    p50 = latencies[N // 2]
+    p99 = latencies[int(N * 0.99)]
+
+    print(f"\nLatency (N={N}): p50={p50:.1f}ms  p99={p99:.1f}ms  max={latencies[-1]:.1f}ms")
+    assert p99 < 50, f"p99 latency {p99:.1f}ms exceeds 50ms SLO"
+
+
+@pytest.mark.asyncio
+@pytest.mark.performance
+async def test_concurrent_tool_calls(shared_client):
+    """100 concurrent tool calls should all complete in < 2 seconds."""
+    CONCURRENCY = 100
+
+    async def single_call(i: int) -> float:
+        start = time.perf_counter()
+        await shared_client.call_tool("calculator", {"expression": f"{i} + {i}"})
+        return time.perf_counter() - start
+
+    start = time.perf_counter()
+    latencies = await asyncio.gather(*[single_call(i) for i in range(CONCURRENCY)])
+    total = time.perf_counter() - start
+
+    print(f"\nConcurrent ({CONCURRENCY}): total={total:.2f}s  "
+          f"mean={statistics.mean(latencies)*1000:.1f}ms  "
+          f"max={max(latencies)*1000:.1f}ms")
+
+    assert total < 2.0, f"100 concurrent calls took {total:.2f}s (limit 2s)"
+    assert max(latencies) < 1.0, f"Slowest call took {max(latencies):.2f}s"
+
+
+@pytest.mark.asyncio
+@pytest.mark.performance
+async def test_throughput_rps(shared_client):
+    """Measure sustained requests per second."""
+    DURATION = 5.0  # seconds
+    count    = 0
+    start    = time.perf_counter()
+
+    while time.perf_counter() - start < DURATION:
+        await shared_client.call_tool("calculator", {"expression": "1+1"})
+        count += 1
+
+    elapsed = time.perf_counter() - start
+    rps = count / elapsed
+    print(f"\nThroughput: {rps:.1f} requests/second over {elapsed:.1f}s")
+    assert rps > 50, f"Throughput {rps:.1f} RPS is below 50 RPS minimum"
+```
+
+---
+
+## Chaos / Fault Injection Testing
+
+Test resilience under failure conditions:
+
+```python
+# tests/chaos/test_resilience.py
+import asyncio, pytest, pytest_asyncio
+from unittest.mock import AsyncMock, patch
+
+@pytest.mark.asyncio
+@pytest.mark.chaos
+async def test_tool_timeout_handled_gracefully(client):
+    """Tool should return isError when underlying operation times out."""
+    with patch("my_server.fetch_data", side_effect=asyncio.TimeoutError):
+        result = await client.call_tool("fetch_data_tool", {"url": "https://example.com"})
+    assert result.isError
+    assert "timeout" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.chaos
+async def test_db_connection_lost_recovers(client):
+    """Server should handle DB connection loss gracefully."""
+    async def failing_db(*args, **kwargs):
+        raise ConnectionError("Database connection lost")
+
+    with patch("my_server.get_db", new_callable=AsyncMock) as mock_db:
+        mock_db.side_effect = failing_db
+        result = await client.call_tool("get_user", {"user_id": "123"})
+
+    assert result.isError
+    assert any(word in result.content[0].text.lower() for word in ["unavailable", "error", "connection"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.chaos
+async def test_external_api_5xx_handled(client):
+    """Tool should handle external API 500 errors gracefully."""
+    import httpx
+    with patch("my_server.httpx.AsyncClient") as mock:
+        mock.return_value.__aenter__.return_value.get = AsyncMock(
+            return_value=httpx.Response(503, text="Service Unavailable")
+        )
+        result = await client.call_tool("web_search", {"query": "test"})
+    assert result.isError
+
+
+@pytest.mark.asyncio
+@pytest.mark.chaos
+async def test_malformed_input_never_crashes_server(client):
+    """Any input — even malformed — should return error, not crash server."""
+    malformed_inputs = [
+        {},  # empty args
+        {"expression": None},
+        {"expression": ""},
+        {"expression": "x" * 100_000},  # very long input
+        {"expression": "\x00\xff\xfe"},  # binary junk
+        {"unknown_key": "value"},
+    ]
+    for args in malformed_inputs:
+        try:
+            result = await client.call_tool("calculator", args)
+            # Either succeeds or returns soft error — both are fine
+            assert isinstance(result.isError, bool)
+        except Exception as e:
+            # Protocol-level errors are acceptable; crashes are not
+            from mcp.shared.exceptions import McpError
+            assert isinstance(e, McpError), f"Unexpected crash with args={args}: {e}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.chaos
+async def test_server_survives_100_rapid_calls(client):
+    """Server should remain functional after 100 rapid concurrent calls."""
+    results = await asyncio.gather(*[
+        client.call_tool("calculator", {"expression": f"{i}*{i}"})
+        for i in range(100)
+    ], return_exceptions=True)
+
+    successful = sum(1 for r in results if not isinstance(r, Exception))
+    assert successful >= 90, f"Too many failures: {100 - successful}/100 failed"
+
+    # Verify server is still responsive after the storm
+    final_result = await client.call_tool("calculator", {"expression": "1+1"})
+    assert not final_result.isError
+```
+
+---
+
+## Test Coverage Strategy
+
+### Coverage configuration
+
+```toml
+# pyproject.toml
+[tool.coverage.run]
+source         = ["my_server", "src"]
+omit           = ["tests/*", "**/__pycache__/*"]
+branch         = true   # measure branch coverage, not just line coverage
+
+[tool.coverage.report]
+fail_under     = 85     # fail CI if coverage drops below 85%
+show_missing   = true
+skip_covered   = false
+exclude_lines  = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "@overload",
+    "raise NotImplementedError",
+]
+```
+
+### Coverage targets by category
+
+| Test Type | Coverage Target | Command |
+|-----------|----------------|---------|
+| Unit tests | ≥ 90% | `pytest tests/unit --cov=my_server` |
+| Integration tests | ≥ 80% | `pytest tests/integration --cov=my_server` |
+| Security tests | All attack vectors | `pytest tests/security -v` |
+| Contract tests | All protocol methods | `pytest tests/contract -v` |
+| E2E tests | Core user journeys | `pytest tests/e2e -m e2e` |
+
+### Running tests in CI tiers
+
+```bash
+# Fast tier (< 30s) — run on every push
+pytest tests/unit -x -q
+
+# Integration tier (< 2min) — run on PR
+pytest tests/unit tests/integration tests/contract -v
+
+# Full tier (< 10min) — run on main branch
+pytest --cov=my_server --cov-report=html -v
+
+# Security tier — run weekly or on dependency updates
+pytest tests/security -v --tb=short
+
+# Performance tier — run on performance-sensitive changes
+pytest tests/performance -v -m performance
+```
+
+---
+
+## Test Utilities Reference
+
+```python
+# tests/utils.py — shared test helpers
+
+import asyncio
+from contextlib import asynccontextmanager
+from mcp import ClientSession
+from mcp.shared.memory import create_connected_server_and_client_session
+
+@asynccontextmanager
+async def quick_client(server_factory):
+    """One-liner client factory for ad-hoc tests."""
+    async with create_connected_server_and_client_session(server_factory()) as session:
+        yield session
+
+async def assert_tool_succeeds(client: ClientSession, name: str, args: dict) -> str:
+    """Assert tool call succeeds and return text content."""
+    result = await client.call_tool(name, args)
+    assert not result.isError, f"Expected success, got error: {result.content[0].text}"
+    return "\n".join(c.text for c in result.content if hasattr(c, "text"))
+
+async def assert_tool_fails(client: ClientSession, name: str, args: dict) -> str:
+    """Assert tool call returns isError=True and return error message."""
+    result = await client.call_tool(name, args)
+    assert result.isError, f"Expected failure, got success: {result.content[0].text}"
+    return result.content[0].text
+
+async def collect_notifications(client: ClientSession, action, timeout: float = 1.0) -> list:
+    """Run action and collect all notifications emitted within timeout."""
+    notifications = []
+    original = client.on_notification
+
+    async def capture(n):
+        notifications.append(n)
+        if original:
+            await original(n)
+
+    client.on_notification = capture
+    await action()
+    await asyncio.sleep(timeout)
+    client.on_notification = original
+    return notifications
+```
+
+---
+
+## Common Testing Pitfalls
+
+| Pitfall | Problem | Fix |
+|---------|---------|-----|
+| Sharing client session across tests | State leaks between tests | Use `function`-scoped fixtures |
+| Not testing `isError` path | Error handling never exercised | Add negative test cases for every tool |
+| Missing contract tests | Protocol violations ship to production | Run contract tests on every build |
+| No performance tests | Latency regressions go unnoticed | Add p99 latency assertions for core tools |
+| Testing implementation details | Tests break on refactor | Test observable behaviour: inputs → outputs |
+| Mocking too aggressively | Tests pass but real integration fails | Add integration tests with real dependencies |
+| No chaos tests | Server crashes on unexpected inputs | Fuzz inputs; test with DB/API failures |
+
+---
+
+## Key Takeaways
+
+- Use **three test levels**: unit (fast), integration (in-process), E2E (subprocess) — run in order.
+- **Contract tests** verify your server is protocol-compliant — run them on every server you build.
+- **Property-based testing** (Hypothesis) finds edge cases you wouldn't think to write manually.
+- **Performance tests** with p50/p99/throughput measurements catch latency regressions before production.
+- **Chaos tests** verify the server remains functional under failure conditions — never silently crashes.
+- Target **85%+ branch coverage** with `fail_under` in `pyproject.toml` to enforce it in CI.

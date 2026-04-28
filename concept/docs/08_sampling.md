@@ -297,3 +297,333 @@ Server ──► sampling/createMessage ──► Client ──► Host
 | **Cost** | Billed to host | Billed to server operator |
 | **Trustworthiness** | Human approved | Unchecked |
 | **Best for** | Agentic tools in trusted hosts | Standalone agents |
+
+---
+
+## Token Budget Management
+
+Track and enforce token usage across all sampling calls within a session:
+
+```python
+from contextvars import ContextVar
+from mcp.server.fastmcp import FastMCP, Context
+
+mcp = FastMCP("budget-aware-server")
+
+# Per-session token budget
+_tokens_used: ContextVar[int] = ContextVar("tokens_used", default=0)
+SESSION_TOKEN_BUDGET = 10_000  # max tokens per session
+
+async def sample_with_budget(
+    ctx: Context,
+    prompt: str,
+    max_tokens: int,
+    **kwargs,
+):
+    """Make a sampling call, tracking and enforcing token budget."""
+    used = _tokens_used.get()
+    remaining = SESSION_TOKEN_BUDGET - used
+
+    if remaining <= 0:
+        raise RuntimeError("Session token budget exhausted. Please start a new session.")
+
+    # Cap max_tokens to remaining budget
+    actual_max = min(max_tokens, remaining)
+
+    result = await ctx.sample(prompt, max_tokens=actual_max, **kwargs)
+
+    # Estimate tokens used (approximate; host returns model info but not token counts)
+    estimated_tokens = len(prompt.split()) + len(result.content.text.split())
+    _tokens_used.set(used + estimated_tokens)
+
+    return result
+
+
+@mcp.tool()
+async def analyse_document(document: str, ctx: Context) -> str:
+    """Analyse a document with token budget enforcement."""
+    summary = await sample_with_budget(
+        ctx,
+        f"Summarise this document in 5 bullet points:\n\n{document}",
+        max_tokens=500,
+    )
+    analysis = await sample_with_budget(
+        ctx,
+        f"Based on this summary, identify the 3 key risks:\n{summary.content.text}",
+        max_tokens=300,
+    )
+    return f"**Summary:**\n{summary.content.text}\n\n**Key Risks:**\n{analysis.content.text}"
+```
+
+---
+
+## Structured Output Extraction
+
+Use sampling to reliably extract structured data from unstructured text:
+
+```python
+import json
+from pydantic import BaseModel, ValidationError
+from mcp.server.fastmcp import FastMCP, Context
+
+mcp = FastMCP("structured-output")
+
+class PersonInfo(BaseModel):
+    name:  str
+    email: str | None
+    phone: str | None
+    company: str | None
+
+class ExtractedPeople(BaseModel):
+    people: list[PersonInfo]
+
+@mcp.tool()
+async def extract_contact_info(text: str, ctx: Context) -> str:
+    """
+    Extract structured contact information from unstructured text.
+    Returns a JSON array of people with name, email, phone, company fields.
+    """
+    system_prompt = (
+        "You are a data extraction assistant. "
+        "Extract contact information and return ONLY valid JSON matching this schema:\n"
+        '{"people": [{"name": "...", "email": "...", "phone": "...", "company": "..."}]}\n'
+        "Use null for missing fields. Never add explanation text."
+    )
+
+    for attempt in range(3):  # retry up to 3 times for valid JSON
+        result = await ctx.sample(
+            f"Extract all contact information from this text:\n\n{text}",
+            system_prompt=system_prompt,
+            max_tokens=1000,
+            temperature=0.0,  # deterministic for structured extraction
+        )
+        try:
+            data = json.loads(result.content.text)
+            validated = ExtractedPeople(**data)
+            return validated.model_dump_json(indent=2)
+        except (json.JSONDecodeError, ValidationError) as e:
+            if attempt == 2:
+                return json.dumps({"error": f"Failed to extract after 3 attempts: {e}"})
+            # Let LLM try again with the error as context
+            text = f"{text}\n\n[Previous response was invalid JSON: {e}. Try again.]"
+
+    return json.dumps({"people": []})
+```
+
+---
+
+## Multi-Modal Sampling
+
+Include images in sampling requests (requires multi-modal model support):
+
+```python
+import base64
+from pathlib import Path
+import mcp.types as types
+from mcp.server import Server
+
+server = Server("multimodal-server")
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    if name == "analyse_screenshot":
+        image_path = arguments["image_path"]
+        question   = arguments.get("question", "Describe what you see.")
+
+        # Read and encode the image
+        image_bytes = Path(image_path).read_bytes()
+        image_b64   = base64.b64encode(image_bytes).decode()
+        mime_type   = "image/png"  # or detect from extension
+
+        # Send image in the sampling messages
+        result = await server.request_context.session.create_message(
+            messages=[
+                types.SamplingMessage(
+                    role="user",
+                    content=types.ImageContent(
+                        type="image",
+                        data=image_b64,
+                        mimeType=mime_type,
+                    ),
+                ),
+                types.SamplingMessage(
+                    role="user",
+                    content=types.TextContent(
+                        type="text",
+                        text=question,
+                    ),
+                ),
+            ],
+            max_tokens=512,
+            model_preferences=types.ModelPreferences(
+                hints=[{"name": "claude-3-5-sonnet"}],  # needs vision capability
+                intelligence_priority=0.8,
+            ),
+        )
+        return [types.TextContent(type="text", text=result.content.text)]
+```
+
+---
+
+## Cost Tracking Pattern
+
+Track LLM costs across sampling calls for billing or budgeting:
+
+```python
+from dataclasses import dataclass, field
+from contextvars import ContextVar
+
+@dataclass
+class SamplingCostTracker:
+    calls: int = 0
+    estimated_input_tokens:  int = 0
+    estimated_output_tokens: int = 0
+
+    @property
+    def estimated_cost_usd(self) -> float:
+        # Claude 3.5 Sonnet pricing (approximate, per million tokens)
+        INPUT_COST_PER_MTK  = 3.00
+        OUTPUT_COST_PER_MTK = 15.00
+        return (
+            self.estimated_input_tokens  * INPUT_COST_PER_MTK  / 1_000_000 +
+            self.estimated_output_tokens * OUTPUT_COST_PER_MTK / 1_000_000
+        )
+
+_cost_tracker: ContextVar[SamplingCostTracker] = ContextVar(
+    "cost_tracker",
+    default=None,
+)
+
+async def tracked_sample(ctx: Context, prompt: str, max_tokens: int, **kwargs):
+    tracker = _cost_tracker.get()
+    if tracker is None:
+        tracker = SamplingCostTracker()
+        _cost_tracker.set(tracker)
+
+    result = await ctx.sample(prompt, max_tokens=max_tokens, **kwargs)
+
+    tracker.calls += 1
+    tracker.estimated_input_tokens  += len(prompt.split()) * 4 // 3  # rough token estimate
+    tracker.estimated_output_tokens += len(result.content.text.split()) * 4 // 3
+
+    return result
+
+@mcp.tool()
+async def expensive_research(topic: str, ctx: Context) -> str:
+    """Research a topic with cost tracking."""
+    tracker = SamplingCostTracker()
+    _cost_tracker.set(tracker)
+
+    step1 = await tracked_sample(ctx, f"Key facts about {topic}:", max_tokens=500)
+    step2 = await tracked_sample(ctx, f"Implications of: {step1.content.text}", max_tokens=500)
+
+    cost_summary = (
+        f"\n\n---\n"
+        f"Sampling stats: {tracker.calls} calls, "
+        f"~{tracker.estimated_input_tokens + tracker.estimated_output_tokens} total tokens, "
+        f"~${tracker.estimated_cost_usd:.4f} USD"
+    )
+    return step2.content.text + cost_summary
+```
+
+---
+
+## ReAct Pattern (Reason + Act)
+
+A production-grade ReAct agent using structured tool dispatch:
+
+```python
+import json, re
+from mcp.server.fastmcp import FastMCP, Context
+
+mcp = FastMCP("react-agent")
+
+REACT_SYSTEM = """You are a ReAct agent. For each step respond with exactly one of:
+
+THOUGHT: <your reasoning about what to do next>
+ACTION: <tool_name>
+ACTION_INPUT: <JSON object with tool arguments>
+
+Or when done:
+THOUGHT: <final reasoning>
+FINAL_ANSWER: <your complete answer>
+
+Available tools: {tools}"""
+
+@mcp.tool()
+async def react_agent(question: str, ctx: Context) -> str:
+    """
+    Run a ReAct (Reason + Act) agent to answer a question.
+    The agent iteratively thinks, selects tools, and acts until it has an answer.
+    """
+    available_tools = ["web_search", "read_file", "get_weather", "calculate"]
+    system = REACT_SYSTEM.format(tools=", ".join(available_tools))
+
+    conversation = [{"role": "user", "content": f"Question: {question}"}]
+
+    for step in range(8):  # max 8 steps
+        response = await ctx.sample(
+            messages=conversation,
+            system_prompt=system,
+            max_tokens=512,
+            temperature=0.1,
+        )
+        text = response.content.text
+        conversation.append({"role": "assistant", "content": text})
+
+        # Parse FINAL_ANSWER
+        if "FINAL_ANSWER:" in text:
+            return text.split("FINAL_ANSWER:", 1)[1].strip()
+
+        # Parse ACTION
+        action_match  = re.search(r"ACTION:\s*(\w+)", text)
+        input_match   = re.search(r"ACTION_INPUT:\s*(\{.*?\})", text, re.DOTALL)
+
+        if action_match and input_match:
+            tool_name = action_match.group(1)
+            try:
+                tool_args = json.loads(input_match.group(1))
+                tool_result = await ctx.call_tool(tool_name, tool_args)
+                observation = tool_result.content[0].text if tool_result.content else "No result"
+            except Exception as e:
+                observation = f"Tool error: {e}"
+
+            conversation.append({
+                "role": "user",
+                "content": f"OBSERVATION: {observation}",
+            })
+        else:
+            # No parseable action — prompt for correction
+            conversation.append({
+                "role": "user",
+                "content": "Please provide an ACTION and ACTION_INPUT, or a FINAL_ANSWER.",
+            })
+
+    return "Agent exceeded maximum steps without a final answer."
+```
+
+---
+
+## Common Sampling Pitfalls
+
+| Pitfall | Problem | Fix |
+|---------|---------|-----|
+| No max iteration limit | Infinite agent loop; runaway costs | Always set `for step in range(N)` |
+| No token budget | Single tool call uses entire context | Implement per-session token budgets |
+| Deterministic for creative tasks | Low quality output | Use `temperature=0.7` for creative; `0.0` for extraction |
+| Including sensitive data in messages | PII/credential leakage | Sanitise inputs; strip secrets before sampling |
+| Ignoring `stopReason: max_tokens` | Truncated output silently treated as complete | Check `result.stopReason` and handle truncation |
+| Using sampling for simple string ops | Unnecessary LLM cost | Only use sampling for tasks requiring genuine language understanding |
+| Not handling sampling not supported | Crash when client lacks `sampling` capability | Check `caps.sampling` before making sampling requests |
+
+---
+
+## Key Takeaways
+
+- **Sampling inverts the flow** — the server asks the *host's* LLM to generate completions.
+- The **host controls model selection** — servers only hint via `ModelPreferences`.
+- **Human approval** is required before the LLM is called — servers cannot silently invoke LLMs.
+- **Token budgets** prevent runaway costs in agentic loops.
+- Use `temperature=0.0` for **structured extraction**; `0.7+` for **creative generation**.
+- The **ReAct pattern** (Reason + Act) is the standard for multi-step agentic tool use via sampling.
+- Always set a **maximum iteration count** in agentic loops to prevent infinite recursion.

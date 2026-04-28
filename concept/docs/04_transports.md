@@ -318,3 +318,235 @@ This is how the **in-memory transport** works for testing (see `mcp.shared.memor
 
 **Always use HTTPS** for SSE and Streamable HTTP in production.
 Never send API keys as query parameters (visible in logs).
+
+---
+
+## Reconnection Patterns
+
+### Client-side reconnection for SSE
+
+```python
+import asyncio
+from mcp.client.sse import sse_client
+from mcp import ClientSession
+
+async def connect_with_retry(
+    url: str,
+    headers: dict,
+    max_attempts: int = 5,
+    base_delay: float = 1.0,
+) -> None:
+    for attempt in range(max_attempts):
+        try:
+            async with sse_client(url, headers=headers) as (r, w):
+                async with ClientSession(r, w) as session:
+                    await session.initialize()
+                    print(f"Connected on attempt {attempt + 1}")
+                    await run_session(session)
+                    return  # clean exit
+        except (ConnectionError, OSError) as e:
+            if attempt == max_attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s, 8s, 16s
+            print(f"Connection failed ({e}); retrying in {delay:.1f}s…")
+            await asyncio.sleep(delay)
+```
+
+### Server-side reconnection handling
+
+SSE servers are inherently stateless between connections. Design for it:
+
+```python
+from mcp.server.fastmcp import FastMCP
+from contextlib import asynccontextmanager
+
+# Session state lives in the session, not globals
+@asynccontextmanager
+async def lifespan(app):
+    # Shared resources (DB pools) live here — survive reconnects
+    import asyncpg
+    app.state.db = await asyncpg.create_pool(dsn="postgresql://localhost/mydb")
+    yield
+    await app.state.db.close()
+
+mcp = FastMCP("reconnect-safe", lifespan=lifespan)
+
+@mcp.tool()
+async def get_status() -> str:
+    """Get server status. Safe to call after reconnect."""
+    return "Server is running"
+```
+
+---
+
+## Reverse Proxy Configuration
+
+### Nginx configuration for SSE transport
+
+```nginx
+# /etc/nginx/sites-available/mcp-server
+server {
+    listen 443 ssl;
+    server_name mcp.example.com;
+
+    ssl_certificate     /etc/ssl/certs/mcp.crt;
+    ssl_certificate_key /etc/ssl/private/mcp.key;
+
+    location /sse {
+        proxy_pass         http://localhost:8080/sse;
+        proxy_http_version 1.1;
+
+        # Critical for SSE: disable buffering
+        proxy_buffering           off;
+        proxy_cache               off;
+        proxy_read_timeout        3600s;   # Keep SSE connection alive
+        proxy_send_timeout        3600s;
+
+        # Forward client IP
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # SSE headers
+        add_header Cache-Control no-cache;
+        add_header Content-Type  text/event-stream;
+    }
+
+    location /messages {
+        proxy_pass         http://localhost:8080/messages;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+### Traefik labels (Docker Compose)
+
+```yaml
+services:
+  mcp-server:
+    image: my-mcp-server:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.mcp.rule=Host(`mcp.example.com`)"
+      - "traefik.http.routers.mcp.tls.certresolver=letsencrypt"
+      # Disable buffering for SSE
+      - "traefik.http.middlewares.mcp-sse.headers.customResponseHeaders.X-Accel-Buffering=no"
+      - "traefik.http.services.mcp.loadbalancer.server.port=8080"
+```
+
+---
+
+## Session Multiplexing (SSE)
+
+The SSE transport supports multiple concurrent client sessions on a single server process via session IDs injected in the SSE endpoint URL:
+
+```
+Client A: GET /sse?session_id=abc123
+Client B: GET /sse?session_id=def456
+
+Client A: POST /messages?session_id=abc123  { tools/call }
+Client B: POST /messages?session_id=def456  { resources/read }
+```
+
+The `SseServerTransport` handles session routing automatically. Each SSE connection creates a new, isolated session.
+
+```python
+from mcp.server.sse import SseServerTransport
+
+sse = SseServerTransport("/messages")
+
+async def handle_sse(request):
+    # Each connection = new session = independent MCP lifecycle
+    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+        await server.run(streams[0], streams[1], init_options)
+        # When this context exits, the session is closed
+```
+
+---
+
+## Transport Performance Characteristics
+
+| Metric | stdio | SSE (HTTP) | Streamable HTTP |
+|--------|-------|------------|-----------------|
+| **Round-trip latency** | ~0.1ms | ~2-50ms (local), 50-200ms (internet) | ~2-50ms |
+| **Throughput** | OS pipe buffer (64KB) | HTTP/1.1 or HTTP/2 | HTTP/2 with streaming |
+| **Max concurrent sessions** | 1 (per process) | Limited by server threads/coroutines | Same |
+| **Reconnect cost** | Re-spawn subprocess | HTTP reconnect + re-initialize | HTTP reconnect + re-initialize |
+| **Firewall friendly** | Local only | HTTPS (port 443) | HTTPS (port 443) |
+| **Load balanceable** | No | Yes (with sticky sessions) | Yes (with sticky sessions) |
+
+> **Sticky sessions are required for SSE servers** — the SSE stream and POST messages must go to the same server instance. Use IP-hash or session-cookie affinity at the load balancer level.
+
+---
+
+## stdio Process Management
+
+### Robust subprocess launch
+
+```python
+import asyncio
+from mcp import StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+# With environment isolation
+params = StdioServerParameters(
+    command="python",
+    args=["-u", "server.py"],         # -u = unbuffered stdout
+    env={
+        "PATH": "/usr/local/bin:/usr/bin",   # explicit PATH
+        "HOME": "/home/user",
+        "API_KEY": os.environ["API_KEY"],     # pass only what's needed
+    },
+)
+
+# Detect subprocess crash
+async with stdio_client(params) as (r, w):
+    async with ClientSession(r, w) as session:
+        try:
+            await session.initialize()
+        except EOFError:
+            print("Server process crashed immediately — check stderr for errors")
+```
+
+### Restarting a crashed stdio server
+
+```python
+async def managed_stdio_server(params: StdioServerParameters, on_ready):
+    while True:
+        try:
+            async with stdio_client(params) as (r, w):
+                async with ClientSession(r, w) as session:
+                    await session.initialize()
+                    await on_ready(session)
+        except (EOFError, ConnectionResetError) as e:
+            print(f"Server died ({e}); restarting in 3s…")
+            await asyncio.sleep(3)
+```
+
+---
+
+## Common Transport Pitfalls
+
+| Pitfall | Transport | Problem | Fix |
+|---------|-----------|---------|-----|
+| No `proxy_buffering off` | SSE | Nginx buffers SSE — messages arrive in bursts | Set `proxy_buffering off` |
+| Short `proxy_read_timeout` | SSE | Nginx closes idle SSE connections | Set timeout ≥ 3600s |
+| No sticky sessions | SSE | POST goes to different server than SSE stream | Configure session affinity at LB |
+| Using port 8080 without TLS in production | HTTP | Credentials exposed in plaintext | Always terminate TLS at proxy |
+| stdout buffering in server | stdio | Messages delayed or not sent | Use `python -u` or `sys.stdout.flush()` |
+| Large single JSON message | All | Parser chokes on multi-MB response | Chunk large data; use resources for big content |
+
+---
+
+## Key Takeaways
+
+- **stdio** is best for local tools — zero network overhead, OS-level isolation.
+- **SSE** is the current standard for remote servers — HTTP-compatible, push capable.
+- **Streamable HTTP** is the recommended transport for new remote servers going forward.
+- For SSE behind a proxy, **disable proxy buffering** and set long read timeouts.
+- **Sticky session routing** is mandatory for SSE horizontal scaling.
+- **Reconnection logic** belongs in the client — design servers to be stateless across connections.

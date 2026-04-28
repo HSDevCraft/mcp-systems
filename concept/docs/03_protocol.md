@@ -344,3 +344,198 @@ options = InitializationOptions(
     capabilities=server.get_capabilities(...)
 )
 ```
+
+---
+
+## Request ID Design
+
+Request IDs are **client-generated** and must be unique within the lifetime of a connection.
+
+```python
+# Good ID strategies
+import itertools, uuid
+
+# Sequential integers (simple, common)
+_id_counter = itertools.count(1)
+request_id = next(_id_counter)   # 1, 2, 3, ...
+
+# UUIDs (globally unique, good for distributed tracing)
+request_id = str(uuid.uuid4())   # "3f2504e0-4f89-11d3-..."
+
+# The SDK manages IDs automatically for client calls:
+result = await session.call_tool("search", {"query": "MCP"})
+# ↑ SDK auto-assigns ID, correlates response internally
+```
+
+**Rules**:
+- IDs are opaque strings or integers — servers must echo the same type back.
+- Reusing an ID while a request with that ID is still in-flight is a protocol violation.
+- Notifications have no ID and never receive a response.
+
+---
+
+## Batch Requests — NOT Supported
+
+JSON-RPC 2.0 defines batch requests (an array of request objects), but **MCP does not support batching**. Each message is a single JSON object on the wire.
+
+```jsonc
+// JSON-RPC batch — NOT supported by MCP
+[
+  {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+  {"jsonrpc":"2.0","id":2,"method":"resources/list"}
+]
+
+// Correct MCP approach — send each request separately
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{}}
+// Both can be in-flight simultaneously (async); responses may arrive out of order
+```
+
+For "batch-like" behaviour, use concurrent `asyncio` tasks:
+
+```python
+tools, resources, prompts = await asyncio.gather(
+    session.list_tools(),
+    session.list_resources(),
+    session.list_prompts(),
+)
+```
+
+---
+
+## Full Message Taxonomy
+
+```
+MCP Messages
+├── Requests (have id, expect response)
+│   ├── Client → Server
+│   │   ├── initialize
+│   │   ├── ping
+│   │   ├── tools/list
+│   │   ├── tools/call
+│   │   ├── resources/list
+│   │   ├── resources/read
+│   │   ├── resources/subscribe
+│   │   ├── resources/unsubscribe
+│   │   ├── prompts/list
+│   │   ├── prompts/get
+│   │   ├── completion/complete
+│   │   └── logging/setLevel
+│   └── Server → Client
+│       ├── sampling/createMessage
+│       └── roots/list
+│
+├── Responses (have matching id, result OR error)
+│   └── Same id as matching request
+│
+└── Notifications (no id, no response)
+    ├── Client → Server
+    │   ├── notifications/initialized
+    │   ├── notifications/roots/list_changed
+    │   └── notifications/cancelled
+    └── Server → Client
+        ├── notifications/tools/list_changed
+        ├── notifications/resources/list_changed
+        ├── notifications/resources/updated
+        ├── notifications/prompts/list_changed
+        ├── notifications/message        (log)
+        └── notifications/progress
+```
+
+---
+
+## Metadata (`_meta`) Field
+
+Any request `params` object may include a `_meta` field for client-to-server metadata:
+
+```jsonc
+{
+  "method": "tools/call",
+  "params": {
+    "name": "long_task",
+    "arguments": { "input": "data" },
+    "_meta": {
+      "progressToken": 42,      // client wants progress notifications
+      "traceId": "abc-123",     // for distributed tracing
+      "clientId": "my-host-v1"  // optional client identifier
+    }
+  }
+}
+```
+
+Servers **MUST** ignore unknown `_meta` fields — forward compatibility.
+
+---
+
+## Protocol Invariants (Rules that Must Never Be Broken)
+
+| Invariant | What happens if violated |
+|-----------|--------------------------|
+| Every request gets exactly one response | Client hangs forever (or times out) |
+| Notification IDs are forbidden | SDK rejects message |
+| Only RUNNING-state requests are accepted | Server returns -32600 Invalid request |
+| `initialized` notification sent before any other client→server request | Server may process requests before handshake is complete |
+| IDs must not be `null` | Ambiguous error handling |
+| `protocolVersion` must be negotiated exactly | Incompatible feature usage |
+
+---
+
+## Wire-Level Debugging
+
+### Inspect stdio traffic
+
+```bash
+# Intercept stdio with tee
+python my_server.py \
+  | tee /tmp/server_out.jsonl \
+  | python my_host.py
+```
+
+### Log all JSON-RPC messages in Python SDK
+
+```python
+import logging
+logging.getLogger("mcp").setLevel(logging.DEBUG)
+# All messages appear in stderr with direction indicators
+```
+
+### Parse a captured session
+
+```python
+import json
+
+with open("/tmp/session.jsonl") as f:
+    for line in f:
+        msg = json.loads(line.strip())
+        if "id" in msg and "method" in msg:
+            print(f"→ Request  id={msg['id']} method={msg['method']}")
+        elif "id" in msg and "result" in msg:
+            print(f"← Response id={msg['id']} ok")
+        elif "id" in msg and "error" in msg:
+            print(f"← Error    id={msg['id']} code={msg['error']['code']}")
+        else:
+            print(f"  Notif  method={msg.get('method')}")
+```
+
+---
+
+## Common Protocol Pitfalls
+
+| Pitfall | Problem | Fix |
+|---------|---------|-----|
+| Using `null` as request ID | Indistinguishable from notification | Always use integer or string IDs |
+| Reusing an in-flight ID | Response routed to wrong handler | Use monotonic counter or UUID |
+| Sending requests before `initialized` notification | Server may reject or queue | Wait for handshake to complete |
+| Ignoring `nextCursor` in list responses | Missing items beyond first page | Always paginate until `nextCursor` is absent |
+| Using JSON-RPC errors for tool logic failures | LLM cannot recover gracefully | Use `isError: true` in tool result content |
+| Writing to stdout in stdio server | Protocol stream corruption | All debug output goes to `stderr` |
+
+---
+
+## Key Takeaways
+
+- MCP uses **JSON-RPC 2.0** — four message types: Request, Success Response, Error Response, Notification.
+- **Responses match requests by `id`** — the SDK handles correlation automatically.
+- **Batching is not supported** — use `asyncio.gather()` for concurrent calls instead.
+- The session lifecycle has four states: `CLOSED → CONNECTING → INITIALIZING → RUNNING → SHUTTING_DOWN → CLOSED`.
+- **Tool logic errors** use `isError: true` in the result body, not JSON-RPC error objects.

@@ -411,3 +411,330 @@ async def keep_alive(session: ClientSession, interval: float = 30.0) -> None:
             # Connection is dead; trigger reconnect logic
             raise ConnectionError("Server ping failed")
 ```
+
+---
+
+## Auto-Reconnect Client
+
+A production-grade client that automatically reconnects after network failures:
+
+```python
+import asyncio
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
+
+class ReconnectingClient:
+    """
+    Wraps ClientSession with automatic reconnect on failure.
+    Suitable for long-running agents that must survive network blips.
+    """
+
+    def __init__(
+        self,
+        server_params: StdioServerParameters | str,  # StdioServerParameters or SSE URL
+        max_reconnects: int = -1,                     # -1 = infinite
+        base_delay: float = 1.0,
+        max_delay: float = 60.0,
+        on_reconnect=None,                            # async callback(session)
+    ):
+        self.params = server_params
+        self.max_reconnects = max_reconnects
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.on_reconnect = on_reconnect
+        self._session: ClientSession | None = None
+        self._reconnect_count = 0
+
+    async def _connect_once(self):
+        if isinstance(self.params, str):
+            cm = sse_client(self.params)
+        else:
+            cm = stdio_client(self.params)
+
+        async with cm as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                self._session = session
+                if self.on_reconnect:
+                    await self.on_reconnect(session)
+                # Keep alive with periodic pings
+                while True:
+                    await asyncio.sleep(30)
+                    try:
+                        await asyncio.wait_for(session.send_ping(), timeout=5.0)
+                    except (asyncio.TimeoutError, Exception):
+                        break  # Connection dead; trigger reconnect
+
+    async def run(self):
+        attempt = 0
+        while self.max_reconnects < 0 or attempt <= self.max_reconnects:
+            try:
+                await self._connect_once()
+                attempt = 0  # reset on clean exit
+            except (ConnectionError, EOFError, OSError) as e:
+                self._reconnect_count += 1
+                delay = min(self.base_delay * (2 ** attempt), self.max_delay)
+                print(f"Connection lost ({e}); reconnecting in {delay:.1f}s (attempt {attempt})")
+                await asyncio.sleep(delay)
+                attempt += 1
+
+    @property
+    def session(self) -> ClientSession:
+        if not self._session:
+            raise RuntimeError("Not connected")
+        return self._session
+```
+
+---
+
+## Context Window Management
+
+Intelligently manage what gets injected into the LLM context from MCP resources and tool results:
+
+```python
+from typing import TypedDict
+
+class ContextMessage(TypedDict):
+    role: str
+    content: str
+
+class ContextWindowManager:
+    """
+    Manages LLM context window usage when combining MCP results with conversation history.
+    """
+
+    def __init__(self, max_tokens: int = 100_000, reserved_for_output: int = 4_000):
+        self.max_tokens = max_tokens
+        self.reserved   = reserved_for_output
+        self._available  = max_tokens - reserved_for_output
+
+    def estimate_tokens(self, text: str) -> int:
+        # Rough estimate: ~4 characters per token (adjust per model)
+        return len(text) // 4
+
+    def fit_tool_result(self, result: str, max_chars: int = 20_000) -> str:
+        """Truncate tool results to fit context budget."""
+        if len(result) <= max_chars:
+            return result
+        kept = result[:max_chars]
+        return f"{kept}\n\n[... truncated {len(result) - max_chars} chars ...]"
+
+    def build_context(
+        self,
+        system_prompt: str,
+        conversation: list[ContextMessage],
+        tool_results: list[tuple[str, str]],  # (tool_name, result_text)
+    ) -> tuple[str, list[ContextMessage]]:
+        """
+        Build the context to send to the LLM, fitting within token budget.
+        Returns (system_prompt, trimmed_messages).
+        """
+        used = self.estimate_tokens(system_prompt)
+
+        # Add tool results as context (newest first)
+        enriched_conversation = list(conversation)
+        for tool_name, result in reversed(tool_results):
+            snippet = self.fit_tool_result(result)
+            msg: ContextMessage = {
+                "role": "user",
+                "content": f"[Tool result: {tool_name}]\n{snippet}",
+            }
+            msg_tokens = self.estimate_tokens(msg["content"])
+            if used + msg_tokens < self._available:
+                enriched_conversation.insert(0, msg)
+                used += msg_tokens
+
+        # Trim oldest conversation messages if over budget
+        while enriched_conversation and used > self._available:
+            oldest = enriched_conversation.pop(0)
+            used -= self.estimate_tokens(oldest["content"])
+
+        return system_prompt, enriched_conversation
+```
+
+---
+
+## LLM Integration Pattern
+
+End-to-end pattern showing how a host integrates MCP tool results into LLM calls:
+
+```python
+import asyncio, json
+from mcp import ClientSession
+from anthropic import Anthropic
+
+class MCPLLMHost:
+    """
+    A complete host that:
+    1. Lists tools from MCP servers
+    2. Injects them into Claude's tool-use API
+    3. Executes tool calls via MCP
+    4. Returns the final answer
+    """
+
+    def __init__(self, session: ClientSession, anthropic_client: Anthropic):
+        self.session = session
+        self.llm     = anthropic_client
+
+    async def get_tools_for_claude(self) -> list[dict]:
+        """Convert MCP tools to Anthropic tool schema."""
+        result = await self.session.list_tools()
+        return [
+            {
+                "name":         t.name,
+                "description":  t.description or "",
+                "input_schema": t.inputSchema,
+            }
+            for t in result.tools
+        ]
+
+    async def run(self, user_message: str) -> str:
+        """Run an agentic loop until Claude returns a final text response."""
+        tools       = await self.get_tools_for_claude()
+        messages    = [{"role": "user", "content": user_message}]
+
+        while True:
+            response = self.llm.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=4096,
+                tools=tools,
+                messages=messages,
+            )
+            messages.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason == "end_turn":
+                # Final text response
+                return next(
+                    (block.text for block in response.content if hasattr(block, "text")),
+                    ""
+                )
+
+            if response.stop_reason == "tool_use":
+                # Execute all tool calls concurrently
+                tool_uses = [b for b in response.content if b.type == "tool_use"]
+                tool_results = await asyncio.gather(*[
+                    self._execute_tool(tu.name, tu.input, tu.id)
+                    for tu in tool_uses
+                ])
+
+                messages.append({
+                    "role":    "user",
+                    "content": tool_results,
+                })
+            else:
+                break
+
+        return "No final answer produced."
+
+    async def _execute_tool(self, name: str, args: dict, tool_use_id: str) -> dict:
+        try:
+            result = await asyncio.wait_for(
+                self.session.call_tool(name, args),
+                timeout=30.0,
+            )
+            content = "\n".join(
+                c.text for c in result.content if hasattr(c, "text")
+            )
+            return {
+                "type":        "tool_result",
+                "tool_use_id": tool_use_id,
+                "content":     content,
+                "is_error":    result.isError,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "type":        "tool_result",
+                "tool_use_id": tool_use_id,
+                "content":     "Tool call timed out after 30 seconds.",
+                "is_error":    True,
+            }
+        except Exception as e:
+            return {
+                "type":        "tool_result",
+                "tool_use_id": tool_use_id,
+                "content":     f"Tool execution error: {e}",
+                "is_error":    True,
+            }
+```
+
+---
+
+## Caching Tool Metadata
+
+Avoid repeated `tools/list` and `resources/list` calls with smart caching:
+
+```python
+import asyncio, time
+from mcp import ClientSession
+from mcp.types import Tool, Resource
+
+class CachedCapabilities:
+    def __init__(self, ttl_seconds: float = 60.0):
+        self._tools:     list[Tool]     | None = None
+        self._resources: list[Resource] | None = None
+        self._tools_ts:  float | None = None
+        self._res_ts:    float | None = None
+        self._ttl = ttl_seconds
+        self._lock = asyncio.Lock()
+
+    def invalidate_tools(self):
+        self._tools = None
+
+    def invalidate_resources(self):
+        self._resources = None
+
+    async def get_tools(self, session: ClientSession) -> list[Tool]:
+        async with self._lock:
+            now = time.monotonic()
+            if self._tools is None or (now - (self._tools_ts or 0)) > self._ttl:
+                result = await session.list_tools()
+                self._tools    = result.tools
+                self._tools_ts = now
+        return self._tools
+
+    async def get_resources(self, session: ClientSession) -> list[Resource]:
+        async with self._lock:
+            now = time.monotonic()
+            if self._resources is None or (now - (self._res_ts or 0)) > self._ttl:
+                result = await session.list_resources()
+                self._resources = result.resources
+                self._res_ts    = now
+        return self._resources
+
+
+caps_cache = CachedCapabilities(ttl_seconds=60)
+
+# Invalidate when server sends notifications
+async def handle_notification(notification) -> None:
+    match notification:
+        case ToolListChangedNotification():
+            caps_cache.invalidate_tools()
+        case ResourceListChangedNotification():
+            caps_cache.invalidate_resources()
+```
+
+---
+
+## Common Client Lifecycle Pitfalls
+
+| Pitfall | Problem | Fix |
+|---------|---------|-----|
+| Calling methods before `initialize()` | `McpError -32600` (session not ready) | Always `await session.initialize()` first |
+| Not registering notification handlers before `initialize()` | Notifications missed during handshake | Register handlers before calling `initialize()` |
+| No reconnect logic | Agent dies permanently on one network blip | Implement exponential backoff reconnection |
+| Re-calling `list_tools()` on every LLM turn | Unnecessary latency | Cache tools; invalidate on `list_changed` notification |
+| Injecting all tool results into context | Context window exhaustion | Use `ContextWindowManager` to fit within token budget |
+| No timeout on `call_tool` | Slow tool hangs entire agent loop | Always wrap tool calls in `asyncio.wait_for(..., timeout=30)` |
+| Concurrent `initialize()` calls | Session state corruption | Initialize once; share the session |
+
+---
+
+## Key Takeaways
+
+- **One client per server connection** — the SDK manages the session internally.
+- **Initialize before use** — always `await session.initialize()` before any other call.
+- **Register notification handlers before `initialize()`** to avoid missing early notifications.
+- **Cache capability metadata** (`list_tools`, `list_resources`) and invalidate on `list_changed` notifications.
+- **LLM integration** = list MCP tools → inject into LLM API → execute tool calls via MCP → loop until final answer.
+- **Auto-reconnect** is essential for production agents — use exponential backoff with jitter.

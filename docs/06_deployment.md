@@ -133,7 +133,7 @@ Collection must be created before the API starts:
 
 ## CI/CD Pipeline
 
-The provided GitHub Actions workflows (`.github/workflows/`) implement:
+Example GitHub Actions workflows can implement:
 
 ### `ci.yml` — runs on every push/PR
 ```
